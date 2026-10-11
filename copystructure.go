@@ -12,26 +12,24 @@ const tagKey = "copy"
 
 // Copy returns a deep copy of v.
 //
-// Copy is unable to copy unexported fields in a struct (lowercase field names).
-// Unexported fields can't be reflected by the Go runtime and therefore
-// copystructure can't perform any data copies.
+// Copy leaves unexported fields at their zero value. An exported field of an
+// embedded unexported struct is copied, because that field is settable.
 //
 // For structs, copy behavior can be controlled with struct tags. For example:
 //
-//   struct {
-//     Name string
-//     Data *bytes.Buffer `copy:"shallow"`
-//   }
+//	struct {
+//	  Name string
+//	  Data *bytes.Buffer `copy:"shallow"`
+//	}
 //
 // The available tag values are:
 //
-// * "ignore" - The field will be ignored, effectively resulting in it being
-//   assigned the zero value in the copy.
+//   - "ignore" - The field will be ignored, effectively resulting in it being
+//     assigned the zero value in the copy.
 //
-// * "shallow" - The field will be be shallow copied. This means that references
-//   values such as pointers, maps, slices, etc. will be directly assigned
-//   versus deep copied.
-//
+//   - "shallow" - The field will be be shallow copied. This means that references
+//     values such as pointers, maps, slices, etc. will be directly assigned
+//     versus deep copied.
 func Copy(v interface{}) (interface{}, error) {
 	return Config{}.Copy(v)
 }
@@ -264,6 +262,8 @@ func (w *walker) Exit(l reflectwalk.Location) error {
 
 			if sf.CanSet() {
 				sf.Set(v)
+			} else if f.Anonymous {
+				copySettableFields(sf, v)
 			}
 		}
 	case reflectwalk.WalkLoc:
@@ -454,8 +454,10 @@ func (w *walker) StructField(f reflect.StructField, v reflect.Value) error {
 	}
 
 	// If PkgPath is non-empty, this is a private (unexported) field.
-	// We do not set this unexported since the Go runtime doesn't allow us.
-	if f.PkgPath != "" {
+	// The Go runtime does not allow setting it from another package.
+	// An embedded struct is different: its exported fields are settable,
+	// so walk those instead of dropping the whole value.
+	if f.PkgPath != "" && !(f.Anonymous && f.Type.Kind() == reflect.Struct) {
 		return reflectwalk.SkipEntry
 	}
 
@@ -617,6 +619,30 @@ func (w *walker) lock(v reflect.Value) {
 
 	locker.Lock()
 	w.locks[w.depth] = locker
+}
+
+// copySettableFields copies exported fields from src into dst. dst may be an
+// unexported embedded struct, which is not settable as a whole. Exported
+// fields on it are. Nested embedded structs are copied the same way.
+func copySettableFields(dst, src reflect.Value) {
+	dst = reflect.Indirect(dst)
+	src = reflect.Indirect(src)
+	if !dst.IsValid() || !src.IsValid() || dst.Kind() != reflect.Struct || src.Type() != dst.Type() {
+		return
+	}
+
+	for i := 0; i < dst.NumField(); i++ {
+		df := dst.Field(i)
+		sf := src.Field(i)
+		if df.CanSet() {
+			df.Set(sf)
+			continue
+		}
+		ft := dst.Type().Field(i)
+		if ft.Anonymous && df.Kind() == reflect.Struct {
+			copySettableFields(df, sf)
+		}
+	}
 }
 
 // wrapPtr is a helper that takes v and always make it *v. copystructure
